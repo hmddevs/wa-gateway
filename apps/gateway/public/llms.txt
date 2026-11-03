@@ -1,0 +1,43 @@
+# HMD WhatsApp Gateway API
+
+> A self-hosted WhatsApp messaging gateway. Access is invite-only and gated by a bearer API key issued by the operator; there is no self-service signup. Integration is over the HTTP API only: send and read WhatsApp messages (to individuals or to groups), react, set presence, and receive signed webhooks. Base URL is https://wa.example.com and every request carries `Authorization: Bearer <API key>` with `Content-Type: application/json`.
+
+## Getting started
+
+- [Authentication](https://wa.example.com/docs/authentication): Bearer-token auth, key format, scopes, and IP allowlists.
+- [Scopes](https://wa.example.com/docs/scopes): the six API key scopes, what each grants, and which endpoints require them.
+- [Get an API key](https://wa.example.com/docs/api-keys): invite-only key issuance by the operator; what to include in a request.
+- [Quickstart](https://wa.example.com/docs/quickstart): send your first message with a complete request and response.
+- [Core concepts](https://wa.example.com/docs/concepts): keys, sessions, projects, the purpose field, message lifecycle, and phone format.
+
+## Sending
+
+- [Send a message](https://wa.example.com/docs/endpoints/send): POST /v1/messages, full body reference, success and error shapes.
+- [Message body types](https://wa.example.com/docs/messages): the text, image, and document body kinds with examples.
+- [Reactions](https://wa.example.com/docs/endpoints/reactions): set or clear an emoji reaction with POST or DELETE /v1/messages/:id/reactions.
+- [Presence and typing](https://wa.example.com/docs/endpoints/presence): POST /v1/sessions/:sessionId/presence for online and typing indicators.
+
+## Reading
+
+- [Get a message](https://wa.example.com/docs/endpoints/get): GET /v1/messages/:id for the full record and status history.
+- [List messages](https://wa.example.com/docs/endpoints/list): GET /v1/messages for a paginated, reverse-chronological list.
+- [List groups](https://wa.example.com/docs/endpoints/groups): GET /v1/groups to discover the WhatsApp group JIDs the bound session belongs to, for use as `to` on a group send.
+- [Session status](https://wa.example.com/docs/endpoints/status): GET /v1/worker/status to check the session connection state.
+- [Health check](https://wa.example.com/docs/endpoints/health): GET /api/health, an unauthenticated liveness probe.
+
+## Reliability
+
+- [Idempotency](https://wa.example.com/docs/idempotency): the idempotencyKey body field and the TTL-bound deduplication window.
+- [Rate limits](https://wa.example.com/docs/rate-limits): the per-key, per-IP, and global tiers plus the per-recipient cap.
+- [Errors](https://wa.example.com/docs/errors): the flat error envelope and the complete error-code catalogue.
+
+## Webhooks
+
+- [Webhooks overview](https://wa.example.com/docs/webhooks): event categories, delivery semantics, and the retry schedule.
+- [Verifying signatures](https://wa.example.com/docs/webhooks/verify): the X-HMD-Signature HMAC-SHA256 scheme and verification code.
+- [Event payloads](https://wa.example.com/docs/webhooks/events): field reference and JSON for every event type.
+
+## For AI agents and codegen
+
+- [OpenAPI specification](https://wa.example.com/openapi.json): machine-readable OpenAPI 3.1 for client codegen, Postman, and Insomnia.
+- [Full integration reference](https://wa.example.com/llms-full.txt): the complete corpus as a single markdown document.

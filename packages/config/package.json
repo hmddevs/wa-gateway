@@ -1,0 +1,17 @@
+{
+  "name": "@hmddevs/config",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared tsconfig / eslint / prettier for the HMD WA monorepo.",
+  "license": "MIT",
+  "main": "index.js",
+  "files": [
+    "tsconfig.base.json",
+    "eslint.base.cjs",
+    "prettier.config.cjs"
+  ],
+  "scripts": {
+    "typecheck": "echo 'config: nothing to typecheck'",
+    "test": "echo 'config: no tests'"
+  }
+}

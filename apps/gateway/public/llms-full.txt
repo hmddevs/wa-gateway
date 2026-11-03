@@ -1,0 +1,1057 @@
+# HMD WhatsApp Gateway API: full integration reference
+
+> A self-hosted, hardened WhatsApp messaging gateway. Access is invite-only and gated by a bearer API key issued by the operator. Integration is over the HTTP API only. This single document is the complete reference an agent needs to write correct integration code: base URL, authentication, every endpoint with copy-pasteable JSON request and response examples, idempotency and rate-limit rules, the full error-code catalogue, and webhook delivery and signature verification.
+
+This corpus is generated from the published documentation pages and verified against the live API surface (`/v1/messages` send schema, `openapi.json`, and the protocol error codes). When in doubt, the machine-readable OpenAPI document at https://wa.example.com/openapi.json is authoritative for request and response shapes.
+
+---
+
+## 1. Base URL, transport, and authentication
+
+- **Base URL:** `https://wa.example.com`
+- **Transport:** HTTPS only. HTTP requests are redirected to HTTPS.
+- **Auth header:** `Authorization: Bearer <API key>` on every request. Missing, malformed, revoked, or unrecognised tokens receive `401 UNAUTHORIZED`.
+- **Content type:** `Content-Type: application/json` for requests with a body. Maximum request body size is 64 KiB; larger bodies receive `413 PAYLOAD_TOO_LARGE`.
+- **Request id:** every response carries an `X-Request-Id` header; every error body carries a matching `requestId`. Log both. Quote them in support requests to security@hmddevs.org.
+
+### Obtaining a key
+
+Keys are **operator-issued only**; there is no self-service signup or registration flow. To request a key, email security@hmddevs.org with:
+
+- **Project name** (a short slug such as `acme-notifications`): becomes your immutable `projectId`.
+- **Intended use** (OTP, order updates, support replies, and so on): determines the scopes granted.
+- **Expected message volume:** sets the per-key rate limit.
+- **Source IP addresses or CIDR ranges:** if supplied, the key is locked to them and requests from any other IP receive `403 IP_NOT_ALLOWED`.
+- **WhatsApp session** (phone number or session id) to bind the key to, if known.
+
+### Key format
+
+Keys follow the structured format `hmd_sk_<division>_<env>_<secret>`:
+
+- `division`: HMD division identifier (for example `developments`, `payments`, `core`).
+- `env`: `test` or `live`. Test keys work only against test sessions and are safe in development. Live keys route to production sessions.
+- `secret`: 32 random bytes, base64url-encoded, 43 characters, no padding. Shown once at creation.
+
+In logs and the admin UI, keys appear in a public reference form with the secret replaced by the first 8 hex characters of its SHA-256 hash (for example `hmd_sk_developments_live_a1b2c3d4`). This form is safe to share in support requests. Never expose a key client-side; call from your server only.
+
+### Key binding, scopes, and IP allowlist
+
+Every key is bound to one WhatsApp session (all sends route to the same phone number; you cannot pick a session per message), a project, one or more scopes, and optionally an IP allowlist.
+
+Scopes gate operations. A request requiring a scope the key lacks returns `403 SCOPE_DENIED`.
+
+| Scope | Grants |
+|---|---|
+| `send:notification` | Send to `channel: "notification"`. |
+| `send:transactional` | Send to `channel: "transactional"`; also required for reactions and presence. |
+| `send:internal` | Send to `channel: "internal"`. |
+| `send:new_recipients` | Defined in the protocol but **not currently enforced**; first-time sends are not blocked. |
+| `read:status` | Call `GET /v1/worker/status` to read the bound session's connection status. |
+| `read:groups` | Call `GET /v1/groups` to discover the WhatsApp group JIDs the bound session belongs to. |
+
+`GET /v1/messages` and `GET /v1/messages/:messageId` need no scope beyond a valid bearer token; the gateway restricts results to the calling key's own session regardless of which scopes it holds.
+
+An IP allowlist restricts the key to one or more CIDR ranges (for example `203.0.113.0/24`). Requests from outside the allowlist receive `403 IP_NOT_ALLOWED`. With no allowlist, any IP may use the key.
+
+### Rotation
+
+To rotate, request a new key, deploy it, then ask the operator to revoke the old one. The old key stays valid until revocation, so there is no service gap. Email security@hmddevs.org for rotation or scope changes.
+
+### Authentication errors
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `UNAUTHORIZED` | 401 | Header missing, malformed, revoked, or key unrecognised. |
+| `SCOPE_DENIED` | 403 | Key valid but lacks the required scope (or path `sessionId` does not match the key's bound session). |
+| `IP_NOT_ALLOWED` | 403 | Request IP outside the key's CIDR allowlist. |
+| `WEBAUTHN_REQUIRED` | 403 | Reserved for admin step-up. Not emitted on consumer routes. |
+
+Always match on the `code` field, never on the human-readable `error` string.
+
+### Liveness check: GET /api/health
+
+The one endpoint that takes no `Authorization` header at all. Returns a minimal payload and touches neither MongoDB nor Redis, so a `200` confirms the process is up, not that its dependencies are healthy.
+
+```bash
+curl https://wa.example.com/api/health
+```
+
+**200 OK:**
+
+```json
+{
+  "ok": true,
+  "service": "hmd-wa-gateway",
+  "time": "2026-06-24T09:00:00.000Z"
+}
+```
+
+---
+
+## 2. Core concepts
+
+### API key, session, and project
+
+An API key carries a complete routing context: the bound **session** (the WhatsApp number all sends go out from), the **project** (`projectId` slug, stamped at issuance, immutable), and the **scopes**. You never pass `projectId` in a request; the gateway reads it from the key and persists it on every message.
+
+### The purpose field
+
+Every send requires a `purpose` field. It is a required enum with no default; omitting it returns `400 INVALID_BODY`.
+
+| purpose | Use |
+|---|---|
+| `otp` | One-time codes. Short TTL, single use. |
+| `magic_link` | Passwordless sign-in link or token. |
+| `transactional` | Order updates, receipts, confirmations, account alerts. |
+| `notification` | State changes, reminders, informational messages. |
+| `support` | Human-to-customer replies in a live support context. |
+| `marketing` | Promotional content. Requires recipient opt-in. |
+| `campaign` | A coordinated marketing campaign message. Requires recipient opt-in. |
+| `newsletter` | Recurring newsletter or digest content. Requires recipient opt-in. |
+| `announcement` | Broadcast announcement (product, service, or policy). |
+| `other` | Anything that does not fit the above. |
+
+`purpose` is distinct from `channel`. The `channel` field (`notification`, `transactional`, `internal`) gates which scope your key needs and how delivery is prioritised. The `purpose` field records intent for compliance routing, retention, and audit. A common pairing is `channel: "transactional"` with `purpose: "otp"`.
+
+A third term, **category**, appears in the `message.queued` webhook: it echoes the resolved `channel`, not a separate concept.
+
+### Message lifecycle
+
+| status | Meaning | Terminal |
+|---|---|---|
+| `queued` | Accepted and waiting for the session to dispatch. | No |
+| `scheduled` | Parked for a future dispatch time (`sendAt` supplied). | No |
+| `sent` | Handed off to WhatsApp; delivery receipts pending. | No |
+| `delivered` | Recipient device received it. | No |
+| `read` | Recipient opened it (only if read receipts are enabled). | Yes |
+| `failed` | Permanent dispatch failure; `errorCode` is set. | Yes |
+| `expired` | TTL elapsed while still queued; never dispatched. | Yes |
+
+Happy path: `queued` to `sent` to `delivered` to `read`. Each transition is recorded in `statusHistory`.
+
+### Phone number format
+
+All numbers use E.164: a `+` followed by country code and subscriber number, 1 to 15 digits, no spaces or punctuation (for example `+447700900123`). The gateway normalises lenient input (such as `447700900123` or `(0)7700 900123`). Numbers that cannot be normalised return `400 INVALID_PHONE`.
+
+### Opt-outs
+
+A recipient may opt out by sending an inbound `STOP` keyword or via an operator action. Once opted out, any send to that number from that session returns `422 OPTED_OUT` and is not enqueued. Opt-out is session-specific. Do not retry; retrying is a compliance violation.
+
+---
+
+## 3. Send a message: POST /v1/messages
+
+Enqueue an outbound WhatsApp message to a single recipient. The gateway accepts, persists, and dispatches the message to the bound session asynchronously, unless you opt into synchronous confirm mode.
+
+### Scope
+
+The key must hold the scope matching the `channel`:
+
+- `send:notification` for `channel: "notification"`
+- `send:transactional` for `channel: "transactional"` (default)
+- `send:internal` for `channel: "internal"`
+
+### Request body fields
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `to` | string | yes | Recipient: E.164 phone number, 6 to 40 characters, canonical form with lenient input normalised (invalid returns `400 INVALID_PHONE`), **or** a WhatsApp group JID (`120363XXXXXXXXXXXX@g.us`) for a standalone group send. See "Sending to a group" below. |
+| `purpose` | enum | yes | One of `otp`, `magic_link`, `transactional`, `notification`, `support`, `marketing`, `campaign`, `newsletter`, `announcement`, `other`. No default; omitting returns `400 INVALID_BODY`. |
+| `body` | object | yes | Discriminated union on `kind`: `text`, `image`, or `document`. See section 4. |
+| `channel` | enum | no (default `transactional`) | `notification`, `transactional`, or `internal`. Drives the scope check. |
+| `idempotencyKey` | string | no | 8 to 128 characters, alphanumeric plus underscore. Deduplicated on `(apiKeyId, idempotencyKey)`. See section 8. |
+| `ttlSeconds` | integer | no (default 1800) | Seconds before a still-queued message is dropped. Minimum 30, maximum 86400 (24 hours). After expiry the message becomes `expired`. |
+| `replyTo` | object | no | Quote a prior outbound message: `{ "messageId": "<uuid>" }`. Must be a gateway UUID from a previous send on the same session. Unknown or cross-session ids return `404 RECIPIENT_NOT_FOUND`. Cannot be combined with `sendAt`. |
+| `sendAt` | string (ISO 8601) | no | Schedule for a future time, at least 30 seconds and at most 30 days ahead, otherwise `422 SEND_AT_PAST`. Cannot be combined with `confirm: true` or `replyTo`. |
+| `confirm` | boolean | no (default false) | Wait synchronously for a terminal status; returns `200` instead of `202`. Cannot be combined with `sendAt`. See section 5. |
+| `confirmTimeoutMs` | integer | no (default 5000) | Milliseconds to wait for the ack when `confirm: true`. Range 300 to 30000. On timeout the response status is `queued`; the message may still arrive. |
+
+Mutually exclusive: `sendAt` with `confirm: true`, and `sendAt` with `replyTo`. Both return `422 INVALID_BODY`.
+
+### Request example
+
+```bash
+curl -X POST https://wa.example.com/v1/messages \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "+447700900123",
+    "channel": "transactional",
+    "purpose": "transactional",
+    "body": {
+      "kind": "text",
+      "text": "Order #4711 confirmed."
+    },
+    "idempotencyKey": "order-4711-confirm-2026-01-15"
+  }'
+```
+
+```typescript
+const res = await fetch('https://wa.example.com/v1/messages', {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${process.env.HMD_WA_API_KEY}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    to: '+447700900123',
+    channel: 'transactional',
+    purpose: 'transactional',
+    body: { kind: 'text', text: 'Order #4711 confirmed.' },
+    idempotencyKey: 'order-4711-confirm-2026-01-15',
+  }),
+});
+const data = await res.json();
+console.log(data.messageId, data.status); // "8e8f3a26-…", "queued"
+```
+
+### Success responses
+
+**202 Accepted (async, default):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "queued"
+}
+```
+
+**202 Accepted (scheduled, when `sendAt` is supplied):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "scheduled",
+  "scheduledFor": "2026-04-30T15:00:00.000Z"
+}
+```
+
+**200 OK (idempotent replay, same `idempotencyKey`):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "queued",
+  "idempotent": true,
+  "requestId": "req_01hx7rk9p3fq4m8n5j6t2w0v1b"
+}
+```
+
+**200 OK (synchronous confirm):** see section 5.
+
+### Status codes
+
+| HTTP | Meaning |
+|---|---|
+| 200 | Synchronous confirm result, or idempotent replay of a prior success. |
+| 202 | Message accepted and queued (or scheduled). |
+| 400 | Malformed request (see error codes). |
+| 401 | Missing or invalid bearer token. |
+| 403 | Scope missing or IP not allowed. |
+| 404 | `replyTo` target not found. |
+| 409 | Idempotency conflict (reserved). |
+| 413 | Body exceeded 64 KiB. |
+| 415 | Content type not `application/json` (reserved). |
+| 422 | Business-logic constraint violated. |
+| 429 | Rate limited (global, per-IP, per-key, or per-recipient cap). |
+| 500 | Unhandled server error. |
+| 503 | Bound session not connected. |
+
+### Sending to a group
+
+Pass a WhatsApp group JID (`120363XXXXXXXXXXXX@g.us`) as `to` instead of a phone number to send to a group. The gateway validates the JID shape and dispatches through the same publish path as a DM send; no other field changes. No extra scope is needed to send: the normal channel scope (`send:notification` / `send:transactional` / `send:internal`) covers group sends the same as DMs. `read:groups` is only needed to *discover* a group's JID (see `GET /v1/groups` in section 6).
+
+The paired session must already be a member of the group; the gateway can only send to groups its own session belongs to. A group JID never appears in the WhatsApp app UI, so read it from `GET /v1/groups` rather than guessing it.
+
+Caveats:
+- **`replyTo` is rejected on group sends.** A group send with `replyTo` set returns `422 INVALID_BODY`; group quoting needs the original sender's `participantJid`, which the gateway does not yet resolve.
+- **The opt-out registry does not apply to groups** (it is keyed on phone number). A group send is never blocked by `422 OPTED_OUT`.
+- **`sendAt` works normally** on group sends; scheduling is not phone-specific.
+
+```bash
+curl -X POST https://wa.example.com/v1/messages \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "120363012345678901@g.us",
+    "channel": "notification",
+    "purpose": "notification",
+    "body": { "kind": "text", "text": "Standup in 10 minutes." }
+  }'
+```
+
+**202 Accepted:**
+
+```json
+{
+  "messageId": "9b7c1e42-3f18-4a9d-9c22-abcdef123456",
+  "status": "queued"
+}
+```
+
+---
+
+## 4. Message body types
+
+The `body` field is a discriminated union on `kind`. Supplying an unrecognised `kind`, an out-of-range field, or a missing required field returns `400 INVALID_BODY`.
+
+### text
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `kind` | `"text"` | yes | Literal. |
+| `text` | string | yes | 1 to 4096 characters. |
+
+```json
+{
+  "to": "+447700900123",
+  "channel": "transactional",
+  "purpose": "transactional",
+  "body": { "kind": "text", "text": "Your order #4711 has been confirmed." }
+}
+```
+
+### image
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `kind` | `"image"` | yes | Literal. |
+| `url` | string (URL) | yes | Publicly reachable `https://` URL. The gateway resolves the hostname and rejects non-HTTPS or private/loopback/link-local/CGNAT/metadata addresses with `400 INVALID_CONTENT`; it does not fetch or scan the image content itself, the paired WhatsApp client fetches it directly. |
+| `caption` | string | no | Up to 1024 characters. |
+
+```json
+{
+  "to": "+447700900123",
+  "channel": "transactional",
+  "purpose": "transactional",
+  "body": {
+    "kind": "image",
+    "url": "https://cdn.example.com/receipt-4711.png",
+    "caption": "Receipt for order #4711"
+  }
+}
+```
+
+### document
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `kind` | `"document"` | yes | Literal. |
+| `url` | string (URL) | yes | Publicly reachable `https://` URL, same host validation as `image`. |
+| `filename` | string | no | 1 to 255 characters. Shown as the attachment title; inferred from the URL if omitted. |
+| `caption` | string | no | Up to 1024 characters. |
+
+```json
+{
+  "to": "+447700900123",
+  "channel": "transactional",
+  "purpose": "transactional",
+  "body": {
+    "kind": "document",
+    "url": "https://cdn.example.com/invoice-4711.pdf",
+    "filename": "invoice-4711.pdf",
+    "caption": "Invoice for order #4711"
+  }
+}
+```
+
+### Media URL validation
+
+For `image` and `document`, the gateway resolves `url`'s hostname before dispatch and rejects it with `400 INVALID_CONTENT` if the scheme is not `https`, the hostname fails to resolve, or any resolved address is loopback, link-local, RFC 1918 private, CGNAT, or a cloud metadata address. This is host-level validation only: the gateway does not fetch, scan, or check the MIME type or size of the resource itself. Once host validation passes, the URL is forwarded as-is and the paired WhatsApp client fetches it directly, so signed URLs must still be valid when that client retrieves them (which can lag the API call), and your storage must allow public access from wherever WhatsApp fetches from, not from the gateway.
+
+---
+
+## 5. Synchronous confirm mode
+
+Pass `"confirm": true` in the body to wait for a terminal acknowledgement before the HTTP response returns. The response is `200` (not `202`). Use it when you must know whether the message reached WhatsApp before deciding to fall back to email or SMS. Cannot be combined with `sendAt`.
+
+The `status` field collapses the lifecycle: `sent`, `delivered`, and `read` all return as `sent`; `expired` returns as `failed` with `errorCode: "EXPIRED"`. On timeout (`confirmTimeoutMs` elapsed, default 5000 ms, range 300 to 30000) the status is `queued` and the message may still arrive later.
+
+**200 OK (sent):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "sent",
+  "requestId": "req_…"
+}
+```
+
+**200 OK (failed):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "failed",
+  "errorCode": "SEND_FAILED",
+  "requestId": "req_…"
+}
+```
+
+**200 OK (timeout):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "queued",
+  "requestId": "req_…"
+}
+```
+
+Treat any `status` other than `sent` as a trigger to fall back to another channel.
+
+---
+
+## 6. Reading messages
+
+### GET /v1/messages/:messageId
+
+Retrieve the full record for one outbound message: current status, full chronological `statusHistory`, body kind, TTL, and any error code. No additional scope required, but the message must belong to the calling key's session. A foreign or absent id returns `404 INVALID_BODY` (the gateway does not distinguish the two cases, to prevent enumeration).
+
+**200 OK (delivered):**
+
+```json
+{
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "to": "+447700900123",
+  "channel": "transactional",
+  "purpose": "otp",
+  "status": "delivered",
+  "statusHistory": [
+    { "status": "queued", "at": "2026-06-24T12:34:56.000Z" },
+    { "status": "sent", "at": "2026-06-24T12:34:57.120Z" },
+    { "status": "delivered", "at": "2026-06-24T12:34:59.480Z" }
+  ],
+  "createdAt": "2026-06-24T12:34:56.000Z",
+  "ttlExpiresAt": "2026-06-24T13:04:56.000Z",
+  "errorCode": null,
+  "body": { "kind": "text" }
+}
+```
+
+**200 OK (failed):**
+
+```json
+{
+  "messageId": "3c4d5e6f-7a8b-9c0d-1e2f-3a4b5c6d7e8f",
+  "to": "+447700900456",
+  "channel": "transactional",
+  "purpose": "transactional",
+  "status": "failed",
+  "statusHistory": [
+    { "status": "queued", "at": "2026-06-24T13:00:00.000Z" },
+    { "status": "failed", "at": "2026-06-24T13:00:01.500Z", "code": "OPTED_OUT", "detail": "Recipient has opted out" }
+  ],
+  "createdAt": "2026-06-24T13:00:00.000Z",
+  "ttlExpiresAt": "2026-06-24T13:30:00.000Z",
+  "errorCode": "OPTED_OUT",
+  "body": { "kind": "text" }
+}
+```
+
+`statusHistory[].code` and `statusHistory[].detail` are present only on `failed` entries. `errorCode` mirrors the final failed entry's `code` and is `null` otherwise. The `body` field returns `kind` only; full content is not returned.
+
+```bash
+curl https://wa.example.com/v1/messages/8e8f3a26-0c47-4f3e-85cd-123456789abc \
+  -H "Authorization: Bearer $HMD_WA_API_KEY"
+```
+
+### GET /v1/messages
+
+Reverse-chronological, paginated list of the calling key's messages. No scope required beyond a valid bearer token. Query parameters: `limit` (default 50, capped at 200) and `before` (pass the `messageId` of the last item from the previous page to walk backwards; omit on the first request). There is no cursor field; a page shorter than `limit` (or empty) means you have reached the end. Each entry is a summary with `body` reduced to `{ "kind": ... }`.
+
+```bash
+curl "https://wa.example.com/v1/messages?limit=20" \
+  -H "Authorization: Bearer $HMD_WA_API_KEY"
+```
+
+**200 OK:**
+
+```json
+{
+  "messages": [
+    {
+      "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+      "to": "+447700900123",
+      "channel": "transactional",
+      "purpose": "otp",
+      "status": "delivered",
+      "createdAt": "2026-06-24T12:34:56.000Z",
+      "body": { "kind": "text" }
+    },
+    {
+      "messageId": "7f3b2e15-1d58-4a0f-96de-234567890bcd",
+      "to": "+447700900456",
+      "channel": "notification",
+      "purpose": "notification",
+      "status": "sent",
+      "createdAt": "2026-06-24T12:33:00.000Z",
+      "body": { "kind": "image" }
+    }
+  ]
+}
+```
+
+### GET /v1/groups
+
+Discover the WhatsApp group JIDs the calling key's bound session belongs to, so one can be passed as `to` on `POST /v1/messages` (see "Sending to a group" in section 3). Requires the `read:groups` scope. Results are strictly scoped to the calling key's own session; a key can never see another session's groups.
+
+Results are derived from persisted chat events, so a group only appears once the session has seen at least one message in it (live or history-synced): there is no way to enumerate a session's groups before any traffic has flowed through them. `subject` (the group's display name) is never populated today, because the worker does not capture `groupMetadata`; treat every response as JID-only. An empty `groups` array is returned, never an error, when the session has no persisted group activity yet.
+
+For a pool-bound key (issued with a `poolId`), this listing reflects the key's statically bound session only, while `POST /v1/messages` resolves the sending session dynamically across the pool. If a send fails over to a pool member that is not a member of the listed group, that send fails at the WhatsApp layer; prefer a single-session key when working with groups.
+
+```bash
+curl https://wa.example.com/v1/groups \
+  -H "Authorization: Bearer $HMD_WA_API_KEY"
+```
+
+**200 OK:**
+
+```json
+{
+  "groups": [
+    {
+      "jid": "120363012345678901@g.us",
+      "lastActivityAt": "2026-07-15T09:12:00.000Z"
+    }
+  ]
+}
+```
+
+**200 OK (no group activity yet):**
+
+```json
+{ "groups": [] }
+```
+
+### GET /v1/worker/status
+
+Live connection status of the session bound to the key. Requires the `read:status` scope. Always returns `200`; the session's status is in the `status` field: `initialising`, `pairing`, `connected`, `degraded`, `offline`, or `stopped`. Reported as `offline` whenever the last heartbeat is older than 60 seconds, regardless of the underlying stored value. Only `connected` accepts new sends; anything else returns `503 WORKER_UNAVAILABLE` on a send.
+
+```bash
+curl https://wa.example.com/v1/worker/status \
+  -H "Authorization: Bearer $HMD_WA_API_KEY"
+```
+
+**200 OK (connected):**
+
+```json
+{
+  "workerId": "wa-m1-bursa-01",
+  "sessionId": "default",
+  "status": "connected",
+  "phoneE164": "+447700900100",
+  "version": "0.5.2",
+  "lastHeartbeatAt": "2026-06-24T09:30:00.000Z",
+  "connectedAt": "2026-06-24T08:00:00.000Z",
+  "queueDepth": 0
+}
+```
+
+**200 OK (offline):**
+
+```json
+{
+  "workerId": "wa-m1-bursa-01",
+  "sessionId": "default",
+  "status": "offline",
+  "phoneE164": null,
+  "version": "0.5.2",
+  "lastHeartbeatAt": "2026-06-24T07:45:00.000Z",
+  "connectedAt": null,
+  "queueDepth": null
+}
+```
+
+`workerId` is always present; `sessionId` is present when the calling key is bound to a session (true for every consumer-issued key). `phoneE164`, `version`, `connectedAt`, `lastHeartbeatAt`, and `queueDepth` are `null` when unknown or not yet connected.
+
+---
+
+## 7. Reactions and presence
+
+### Reactions
+
+WhatsApp allows one reaction per sender per message; a second `POST` replaces the first. The target `messageId` must be the gateway UUID of a prior outbound send on the same session, and the message must already be `sent` (reacting to a still-`queued` message returns `422 INVALID_REACTION`). Both verbs require the `send:transactional` scope.
+
+**POST /v1/messages/:messageId/reactions** sets a reaction. Body:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `emoji` | string | yes | 1 to 8 characters, at least one Extended_Pictographic codepoint. Empty or non-emoji returns `422 INVALID_REACTION`. To remove, use DELETE. |
+
+```bash
+curl -X POST https://wa.example.com/v1/messages/8e8f3a26-0c47-4f3e-85cd-123456789abc/reactions \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "emoji": "👍" }'
+```
+
+**202 Accepted:**
+
+```json
+{
+  "messageId": "1f0a4c01-ab12-4de3-8f90-123456789def",
+  "emoji": "👍",
+  "status": "queued"
+}
+```
+
+The returned `messageId` identifies the reaction operation, not the original message.
+
+**DELETE /v1/messages/:messageId/reactions** clears the reaction. No request body.
+
+```bash
+curl -X DELETE https://wa.example.com/v1/messages/8e8f3a26-0c47-4f3e-85cd-123456789abc/reactions \
+  -H "Authorization: Bearer $HMD_WA_API_KEY"
+```
+
+**202 Accepted:**
+
+```json
+{
+  "messageId": "2a1b5d02-cd34-5ef4-9a01-234567890ef0",
+  "emoji": "",
+  "status": "queued"
+}
+```
+
+Status codes: 202 accepted, 400 `INVALID_BODY` (invalid UUID), 403 `SCOPE_DENIED`, 404 `RECIPIENT_NOT_FOUND`, 422 `INVALID_REACTION`, 503 `WORKER_UNAVAILABLE`.
+
+### Presence and typing
+
+**POST /v1/sessions/:sessionId/presence** publishes a presence or typing indicator. Presence is ephemeral and fire-and-forget: if the session is not connected the update is dropped. Requires the `send:transactional` scope, and the path `sessionId` must match the key's bound session (a mismatch returns `403 SCOPE_DENIED`).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `state` | enum | yes | `available`, `unavailable`, `composing`, `recording`, or `paused`. Any other value returns `422 INVALID_PRESENCE_STATE`. |
+| `to` | string (E.164) | no | When set, scopes the update to that chat (typing indicators). When omitted, the update is session-wide. Invalid returns `400 INVALID_PHONE`. |
+
+State meanings: `available` and `unavailable` are global online/offline (no `to`). `composing` (typing), `recording` (audio or video), and `paused` (stopped typing, clears the indicator) are chat-scoped and need a `to`.
+
+```bash
+# Global online
+curl -X POST https://wa.example.com/v1/sessions/default/presence \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "state": "available" }'
+
+# Chat-level typing indicator
+curl -X POST https://wa.example.com/v1/sessions/default/presence \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "state": "composing", "to": "+447700900123" }'
+```
+
+**200 OK:**
+
+```json
+{ "status": "queued" }
+```
+
+Status codes: 200 accepted, 400 `INVALID_BODY` / `INVALID_PHONE`, 403 `SCOPE_DENIED`, 422 `INVALID_PRESENCE_STATE`, 503 `WORKER_UNAVAILABLE`.
+
+---
+
+## 8. Idempotency
+
+Supply an `idempotencyKey` (8 to 128 characters, alphanumeric plus underscore) in the send body. The gateway deduplicates on the pair `(apiKeyId, idempotencyKey)`. There is no separate header.
+
+- **First call:** the message is created and the gateway returns `202`.
+- **Replay within the window:** the original `messageId` is returned with `idempotent: true` and status `200`. No new message is created.
+
+**The deduplication window equals the message TTL (default 30 minutes, maximum 24 hours).** This is the most important rule: a retry that arrives *after* the window has closed creates a NEW message, because the original record (and its key) has expired. For OTP and similar retries, use a key that is stable within the OTP's own lifetime, derived from a domain object (order id, alert hash, user id plus a time bucket). A random UUID per attempt defeats the purpose.
+
+```bash
+# First call
+curl -X POST https://wa.example.com/v1/messages \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "+447700900123",
+    "channel": "transactional",
+    "purpose": "otp",
+    "body": { "kind": "text", "text": "Your code is 482913." },
+    "idempotencyKey": "otp_user_42_2026_06_24T10_00_00Z"
+  }'
+
+# Same request retried after a timeout; no duplicate is created
+curl -X POST https://wa.example.com/v1/messages \
+  -H "Authorization: Bearer $HMD_WA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "+447700900123",
+    "channel": "transactional",
+    "purpose": "otp",
+    "body": { "kind": "text", "text": "Your code is 482913." },
+    "idempotencyKey": "otp_user_42_2026_06_24T10_00_00Z"
+  }'
+```
+
+`409 IDEMPOTENCY_CONFLICT` is reserved for a future case where a replay supplies a different request body than the original. It is not yet enforced.
+
+---
+
+## 9. Rate limits
+
+Every authenticated request passes through three independent fixed-window (60-second) tiers, evaluated in order; the first to reject wins. Exceeding any tier returns `429 RATE_LIMITED`.
+
+| Tier | Limit | Keyed by |
+|---|---|---|
+| Global | 10,000 req/min across all clients | All requests |
+| Per API key | Default 60 req/min; range 1 to 10,000, set at issuance | API key id |
+| Per IP | 300 req/min | Client IP |
+
+The per-key limit and its quota are configured at issuance and reflected in the response (contact security@hmddevs.org to change the default). The gateway does **not** emit `X-RateLimit-*` or `Retry-After` headers; treat every `429` as a back-off signal.
+
+### Per-recipient cap (OTP-bomb protection)
+
+In addition, `POST /v1/messages` enforces at most **5 sends to the same E.164 number within any 10-minute window**. This cap is **global across all API keys** (keyed on the recipient, not the caller) so a flood cannot be spread across keys. Breaching it returns `429 RATE_LIMITED` (the same code, not a distinct one). Scheduled sends are charged at fire time, not enqueue time. If the gateway cannot reach Redis to check the counter it fails closed with `503` rather than allowing an unbounded flood.
+
+### Handling 429
+
+Use exponential backoff with jitter: wait an initial interval (for example 1 second), double it with up to ±20% jitter on each failure, cap at around 60 seconds, and surface the error after a configurable number of attempts. A per-recipient `RATE_LIMITED` is not a throughput error; it resets after 10 minutes, so retrying immediately will not help.
+
+`VELOCITY_EXCEEDED` and `NEW_RECIPIENT_BLOCKED` are defined with HTTP 429 but are **reserved and not currently emitted**.
+
+---
+
+## 10. Error codes
+
+All non-2xx responses share a flat JSON envelope. Always branch on `code`, never on the `error` string (which may be rephrased at any time).
+
+```json
+{
+  "error": "Missing scope: send:transactional",
+  "code": "SCOPE_DENIED",
+  "requestId": "req_01hx7rk9p3fq4m8n5j6t2w0v1b"
+}
+```
+
+Fields: `error` (human-readable, do not match), `code` (stable, match on this), `requestId` (echoed in `X-Request-Id`), `details` (optional structured context).
+
+### Emitted codes (a caller can receive these)
+
+| Code | HTTP | When it happens | What to do |
+|---|---|---|---|
+| `INVALID_PHONE` | 400 | `to` could not be normalised to E.164. | Supply a valid E.164 number. |
+| `INVALID_CONTENT` | 400 | An `image` or `document` `url` failed host validation: non-HTTPS, unresolvable, or resolves to a private/loopback/link-local/CGNAT/metadata address. | Use a public HTTPS URL that does not resolve to an internal address. |
+| `INVALID_BODY` | 400 / 404 / 422 | 400: JSON parse failure, schema violation, missing `purpose`, unsupported body kind, or forbidden field combination. 404: a path resource (`messageId`, session id) not found, deliberately not distinguished from foreign-owned to prevent enumeration. 422: semantically rejected (for example a `replyTo` target on a different session, or `replyTo` combined with a group `to`). | Fix the body or path; check `error` for the failing field. |
+| `UNAUTHORIZED` | 401 | Missing, malformed, revoked, or unrecognised bearer token. | Check the `Authorization` header and key validity. |
+| `SCOPE_DENIED` | 403 | Key lacks the required scope, or path `sessionId` does not match the key's session. | Request the scope from the operator. |
+| `IP_NOT_ALLOWED` | 403 | Client IP outside the key's CIDR allowlist. | Update the allowlist or send from a permitted IP. |
+| `RECIPIENT_NOT_FOUND` | 404 | `replyTo` or reaction target unknown to this session, or on a different session. | Verify the `messageId` is from the same session. |
+| `PAYLOAD_TOO_LARGE` | 413 | Request body exceeded 64 KiB. | Reference large assets by URL rather than embedding. |
+| `INVALID_REACTION` | 422 | Emoji empty on POST, not a valid emoji, or the target message is still `queued`. | Supply a valid emoji; wait for the target to reach `sent`. |
+| `INVALID_PRESENCE_STATE` | 422 | `state` is not one of the five enum values. | Use `available`, `unavailable`, `composing`, `recording`, or `paused`. |
+| `SEND_AT_PAST` | 422 | `sendAt` is in the past, under 30 s ahead, or over 30 days away. | Supply a `sendAt` between 30 seconds and 30 days from now. |
+| `OPTED_OUT` | 422 | Recipient is on this session's opt-out registry. | Do not send; do not retry. |
+| `RATE_LIMITED` | 429 | A rate-limit tier (global, per-IP, per-key) or the per-recipient cap was exceeded. | Back off with exponential backoff. |
+| `WORKER_UNAVAILABLE` | 503 | Bound session (or no pool member) not connected. | Check session status; fall back or retry when online. |
+| `INTERNAL` | 500 | Unhandled server error. | Quote `requestId` and timestamp to security@hmddevs.org. |
+
+### Reserved codes (defined but not currently emitted)
+
+`WEBAUTHN_REQUIRED` (403, admin step-up), `IDEMPOTENCY_CONFLICT` (409, body-mismatch replay), `UNSUPPORTED_MEDIA_TYPE` (415, content-type guard, not active), `VELOCITY_EXCEEDED` (429, per-recipient burst guard), `NEW_RECIPIENT_BLOCKED` (429, new-recipient gate, removed), `MAINTENANCE` (503, maintenance mode). Do not build handling that depends on receiving these today.
+
+### Branching on code
+
+```typescript
+const res = await fetch('https://wa.example.com/v1/messages', {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${process.env.HMD_WA_API_KEY}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ to, purpose, body }),
+});
+
+if (!res.ok) {
+  const err = await res.json();
+  switch (err.code) {
+    case 'OPTED_OUT':
+      await markContactOptedOut(to); // do not retry
+      break;
+    case 'RATE_LIMITED':
+      // transient; back off and retry
+      break;
+    case 'WORKER_UNAVAILABLE':
+      await sendViaSMS(to, message); // session offline; fall back
+      break;
+    default:
+      throw new Error(err.code); // log err.requestId for support
+  }
+}
+```
+
+---
+
+## 11. Webhooks
+
+Webhooks push events to an HTTPS URL you register, so your server is notified without polling. Endpoints are registered by the operator; at registration you supply a publicly reachable HTTPS URL and receive a signing secret (shown once). Each delivery is an HTTP `POST` with a JSON body. Your endpoint must respond with a `2xx` status within 5 seconds; `204 No Content` is recommended. Respond immediately and process in the background.
+
+### Delivery headers
+
+| Header | Notes |
+|---|---|
+| `Content-Type` | Always `application/json`. |
+| `X-HMD-Signature` | HMAC-SHA256 signature, format `t=<unix-seconds>,v1=<hex>`. See section 12. |
+| `X-HMD-Event` | The event type (mirrors `event.type`), for routing before parsing. |
+| `X-HMD-Delivery-Id` | Unique per delivery attempt; differs from `eventId`. |
+
+### Common envelope
+
+Every event carries `type`, `at` (ISO 8601 UTC), `eventId` (UUID v4, stable across retries; deduplicate on it), and `sessionId`.
+
+### Event types (nine)
+
+```typescript
+type WebhookEventType =
+  | 'message.queued'      // outbound accepted and enqueued
+  | 'message.sent'        // dispatched to the messaging network
+  | 'message.delivered'   // recipient device received it
+  | 'message.read'        // recipient opened it
+  | 'message.failed'      // terminal failure
+  | 'inbound.received'    // contact sent a message to your session
+  | 'inbound.reaction'    // contact reacted to a message
+  | 'contact.opted_out'   // contact added to opt-out registry
+  | 'webhook.test';       // synthetic test event from admin interface
+```
+
+### Delivery semantics
+
+At-least-once delivery: an event may arrive more than once; always deduplicate on `eventId`. No ordering guarantee: `message.read` may precede `message.delivered`. Handle unknown event types with a default case that acknowledges with `204`.
+
+### Retry schedule
+
+If your endpoint does not return a `2xx` within 5 seconds, the gateway retries. Delays after the immediate initial attempt: 30 s, 2 min, 10 min, 1 h, 6 h, 24 h. After the seventh attempt the event is marked abandoned (no further attempts).
+
+### Event payloads
+
+**message.queued** (also carries `to` and `category`, the resolved channel):
+
+```json
+{
+  "type": "message.queued",
+  "at": "2026-06-24T14:30:45.123Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440001",
+  "sessionId": "default",
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "to": "+447700900123",
+  "category": "transactional"
+}
+```
+
+**message.sent / message.delivered / message.read** (all carry `messageId` and the network `waMessageId`):
+
+```json
+{
+  "type": "message.sent",
+  "at": "2026-06-24T14:30:46.500Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440002",
+  "sessionId": "default",
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "waMessageId": "true_447700900123@c.us_ABCD1234..."
+}
+```
+
+`message.read` is only emitted when the recipient has read receipts enabled.
+
+**message.failed** (`status` is `failed` or `expired`; `error.retryable` is false for permanent failures):
+
+```json
+{
+  "type": "message.failed",
+  "at": "2026-06-24T14:30:50.000Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440005",
+  "sessionId": "default",
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "status": "failed",
+  "error": {
+    "code": "OPTED_OUT",
+    "message": "Recipient has opted out",
+    "retryable": false
+  }
+}
+```
+
+**inbound.received** (the `content` field is a discriminated union on `content.type`, which is distinct from the outbound `body.kind`):
+
+```json
+{
+  "type": "inbound.received",
+  "at": "2026-06-24T14:35:10.500Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440006",
+  "sessionId": "default",
+  "waMessageId": "false_447700900124@c.us_ABCD5678...",
+  "from": "+447700900124",
+  "content": { "type": "text", "text": "Hello, I need help with my order." }
+}
+```
+
+Image and document variants carry `content.mediaUrl` (valid up to 3 days), `content.mediaMimeType`, optional `content.caption`, and (document only) `content.mediaFileName`:
+
+```json
+{
+  "type": "inbound.received",
+  "at": "2026-06-24T14:35:35.300Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440011",
+  "sessionId": "default",
+  "waMessageId": "false_447700900124@c.us_IJKL3456...",
+  "from": "+447700900124",
+  "content": {
+    "type": "document",
+    "mediaUrl": "https://media-bucket.example.com/receipt.pdf",
+    "mediaFileName": "receipt.pdf",
+    "mediaMimeType": "application/pdf",
+    "caption": "Invoice #1234"
+  }
+}
+```
+
+**inbound.reaction** (`messageId` is null when the reacted-to message was not sent by this session; `emoji` empty means the reaction was cleared):
+
+```json
+{
+  "type": "inbound.reaction",
+  "at": "2026-06-24T14:36:05.200Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440007",
+  "sessionId": "default",
+  "messageId": "8e8f3a26-0c47-4f3e-85cd-123456789abc",
+  "waMessageId": "true_447700900123@c.us_ABCD1234...",
+  "targetFromMe": true,
+  "from": "+447700900124",
+  "emoji": "👍"
+}
+```
+
+**contact.opted_out** (`source` is `keyword` or `admin`; `keyword` present only for keyword opt-outs). After this event, sends to that number return `422 OPTED_OUT`:
+
+```json
+{
+  "type": "contact.opted_out",
+  "at": "2026-06-24T14:37:15.000Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440008",
+  "sessionId": "default",
+  "phone": "+447700900125",
+  "source": "keyword",
+  "keyword": "STOP"
+}
+```
+
+**webhook.test** (synthetic; acknowledge with `204` and take no action):
+
+```json
+{
+  "type": "webhook.test",
+  "at": "2026-06-24T14:38:00.000Z",
+  "eventId": "550e8400-e29b-41d4-a716-446655440009",
+  "sessionId": "default",
+  "message": "This is a test webhook from HMD WA Gateway."
+}
+```
+
+---
+
+## 12. Verifying webhook signatures
+
+Every webhook is signed with HMAC-SHA256. Verify the `X-HMD-Signature` header on the **raw request body bytes** before parsing JSON; re-serialising the parsed object can change whitespace and field order and break verification.
+
+### Header and scheme
+
+The header carries two comma-separated pairs: `t` (unix seconds when signed, used for the replay window) and `v1` (HMAC-SHA256 of the signed payload, lowercase hex, 64 characters).
+
+```
+X-HMD-Signature: t=1719245696,v1=a1b2c3d4e5f6789abcdef0123456789abcdef0123456789abcdef0123456789ab
+```
+
+The signed payload is the timestamp, a literal dot, and the raw body:
+
+```
+signed_payload = t + "." + rawBody
+signature      = HMAC-SHA256(webhookSecret, signed_payload)
+```
+
+`webhookSecret` is the base64url-encoded 32-byte (43-character) signing secret shown at registration; pass it as-is to the HMAC function.
+
+### Verification steps
+
+1. Read `X-HMD-Signature`; if absent, reject with `400`.
+2. Parse it: split on `,`, then on the first `=`, to get `t` and `v1`.
+3. Enforce the replay window: reject if `|now - t|` exceeds **300 seconds** (±5 minutes). Keep your clock synced via NTP.
+4. Build `signedPayload = t + "." + rawBody`.
+5. Compute `HMAC-SHA256(webhookSecret, signedPayload)` as hex.
+6. Compare against `v1` using a **constant-time** comparison.
+7. If equal, the request is authentic; parse and process.
+
+### Node verification (node:crypto)
+
+```typescript
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+/**
+ * Verify an incoming HMD webhook request. Call before parsing the JSON body.
+ * @param rawBody The raw UTF-8 string body (do NOT pre-parse).
+ * @param header  The X-HMD-Signature header value.
+ * @param secret  The webhook signing secret (base64url-encoded string).
+ * @returns true when valid; false when the signature is wrong or the request is stale.
+ */
+export function verifyWebhookSignature(
+  rawBody: string,
+  header: string,
+  secret: string,
+): boolean {
+  const parts: Record<string, string> = {};
+  for (const part of header.split(',')) {
+    const idx = part.indexOf('=');
+    if (idx !== -1) parts[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+  }
+
+  const t = parts['t'] ? Number(parts['t']) : null;
+  const v1 = parts['v1'] ?? null;
+  if (!t || !v1 || !Number.isFinite(t)) return false;
+
+  // Replay window: ±300 s
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - t) > 300) return false;
+
+  const signedPayload = `${t}.${rawBody}`;
+  const expected = createHmac('sha256', secret)
+    .update(signedPayload, 'utf8')
+    .digest('hex');
+
+  const eBuf = Buffer.from(expected, 'hex');
+  const vBuf = Buffer.from(v1, 'hex');
+  if (eBuf.length !== vBuf.length) return false;
+  return timingSafeEqual(eBuf, vBuf);
+}
+```
+
+### Express handler
+
+```typescript
+import express from 'express';
+import { verifyWebhookSignature } from './verify';
+
+const app = express();
+
+app.post('/webhooks/wa', express.raw({ type: 'application/json' }), (req, res) => {
+  const rawBody = (req.body as Buffer).toString('utf8');
+  const header = req.header('x-hmd-signature') ?? '';
+  const secret = process.env.HMD_WA_WEBHOOK_SECRET!;
+
+  if (!verifyWebhookSignature(rawBody, header, secret)) {
+    res.status(400).json({ error: 'invalid_signature' });
+    return;
+  }
+
+  res.status(204).end(); // respond immediately
+  const event = JSON.parse(rawBody);
+  void processEvent(event); // process in background
+});
+```
+
+---
+
+## 13. For AI agents and codegen
+
+The machine-readable OpenAPI 3.1 document is at https://wa.example.com/openapi.json. Use it to generate a typed client, import into Postman or Insomnia, or drive contract tests. This corpus and the OpenAPI document describe the same HTTP API; where shapes differ in detail, the OpenAPI document is authoritative. A TypeScript client library is also available at `packages/sdk` (published as `@hmddevs/wa-sdk`); otherwise integrate against the raw HTTP API as described above.

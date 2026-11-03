@@ -1,0 +1,1406 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "HMD WA Gateway API",
+    "version": "1.0.0",
+    "description": "Public consumer API for the HMD WhatsApp messaging gateway. Send outbound WhatsApp messages, inspect delivery status, manage reactions and presence, and receive lifecycle events over signed webhooks.",
+    "contact": {
+      "email": "security@hmddevs.org"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://wa.example.com"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    { "name": "Health", "description": "Liveness checks." },
+    { "name": "Messages", "description": "Send and inspect outbound messages." },
+    { "name": "Groups", "description": "Discover WhatsApp group JIDs the session belongs to." },
+    { "name": "Reactions", "description": "Set or clear emoji reactions." },
+    { "name": "Presence", "description": "Push typing and online indicators." },
+    { "name": "Worker", "description": "Session and worker health." }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["Health"],
+        "operationId": "getHealth",
+        "summary": "Liveness check",
+        "description": "Returns a minimal liveness payload. Does not touch Mongo or Redis and never leaks internals. This is the only public endpoint that requires no authentication.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is alive.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": ["Messages"],
+        "operationId": "sendMessage",
+        "summary": "Send a message",
+        "description": "Enqueue an outbound WhatsApp message to a single recipient. By default the gateway accepts, persists, and dispatches the message asynchronously (202, status `queued`). Supply `sendAt` to schedule it (202, status `scheduled`), or `confirm: true` to wait synchronously for a terminal status (200). A replay of a previously used `idempotencyKey` returns the original result with `idempotent: true` (200). The required scope is derived from `channel`: `send:notification`, `send:transactional` (default), or `send:internal`. For `image` and `document` bodies, the gateway resolves and host-validates the media `url` before dispatch (HTTPS required; loopback, link-local, private, CGNAT, and metadata addresses rejected) and returns `400 INVALID_CONTENT` on failure; this is resolve-time host validation only, not a fetch or content scan of the media itself.",
+        "parameters": [{ "$ref": "#/components/parameters/IdempotencyKeyHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SendMessageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Synchronous confirm result, or idempotent replay of a prior request.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SendMessageResponse" }
+              }
+            }
+          },
+          "202": {
+            "description": "Message accepted and queued, or scheduled for a future time.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SendMessageResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      },
+      "get": {
+        "tags": ["Messages"],
+        "operationId": "listMessages",
+        "summary": "List messages",
+        "description": "List messages sent by the calling API key, newest first. Page backwards by passing the `messageId` of the last item in a page as the `before` query parameter; a page with fewer than `limit` items is the last page.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of items to return. Values above the maximum are clamped to 200.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "Page backwards: pass the messageId of the last item from the previous page to fetch older messages.",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of messages.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageListResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/messages/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/MessageId" }],
+      "get": {
+        "tags": ["Messages"],
+        "operationId": "getMessage",
+        "summary": "Get a message",
+        "description": "Fetch the detailed status of a single message, including its chronological status history. Returns 404 if the message does not exist or does not belong to the calling API key.",
+        "responses": {
+          "200": {
+            "description": "The message detail.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Message" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/messages/{id}/reactions": {
+      "parameters": [{ "$ref": "#/components/parameters/MessageId" }],
+      "post": {
+        "tags": ["Reactions"],
+        "operationId": "setReaction",
+        "summary": "Set a reaction",
+        "description": "Set an emoji reaction on a prior outbound message in this session. Fire-and-forget: the gateway acknowledges the queued operation (202). Requires the `send:transactional` scope. The target message must belong to this session and must already have been sent. To clear a reaction, use the DELETE method instead.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ReactionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Reaction queued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReactionResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      },
+      "delete": {
+        "tags": ["Reactions"],
+        "operationId": "clearReaction",
+        "summary": "Clear a reaction",
+        "description": "Clear the reaction this session set on a message by sending an empty emoji. Fire-and-forget: the gateway acknowledges the queued operation (202). Requires the `send:transactional` scope. The target message must belong to this session and must already have been sent.",
+        "responses": {
+          "202": {
+            "description": "Reaction clear queued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReactionResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/groups": {
+      "get": {
+        "tags": ["Groups"],
+        "operationId": "listGroups",
+        "summary": "List groups",
+        "description": "Discover the WhatsApp group JIDs the calling API key's bound session belongs to, so one can be passed as `to` on `POST /v1/messages`. Requires the `read:groups` scope. Results are derived from persisted chat events, so a group only appears once the session has seen at least one message in it (live or history-synced). Entries may also carry group metadata (subject, participants, admin roles and more) when the gateway has captured it; all metadata fields are optional and additive. Privacy note: `participants` exposes every member's JID and admin role to any key holding `read:groups`.",
+        "responses": {
+          "200": {
+            "description": "The session's known groups.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GroupListResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/sessions/{sessionId}/presence": {
+      "parameters": [
+        {
+          "name": "sessionId",
+          "in": "path",
+          "required": true,
+          "description": "The session identifier. Must match the session the calling API key is bound to.",
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "tags": ["Presence"],
+        "operationId": "setPresence",
+        "summary": "Push a presence update",
+        "description": "Push a presence indicator (typing, recording, online or offline) for this session. Best-effort at the WhatsApp layer: if the session is briefly disconnected the update is dropped. Requires the `send:transactional` scope and the API key must be bound to the session named in the path. When `to` is set, the indicator is scoped to that chat only.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PresenceRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Presence update queued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PresenceResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/worker/status": {
+      "get": {
+        "tags": ["Worker"],
+        "operationId": "getWorkerStatus",
+        "summary": "Get worker status",
+        "description": "Report the health of the worker and session bound to the calling API key. Requires the `read:status` scope. A session whose heartbeat is older than 60 seconds is reported as `offline`.",
+        "responses": {
+          "200": {
+            "description": "Current worker and session health.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WorkerStatusResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "messageQueued": {
+      "post": {
+        "operationId": "webhookMessageQueued",
+        "summary": "message.queued",
+        "description": "Sent when a message is accepted and queued for dispatch.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageQueuedEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "messageSent": {
+      "post": {
+        "operationId": "webhookMessageSent",
+        "summary": "message.sent",
+        "description": "Sent when the worker confirms the message left the device.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageSentEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "messageDelivered": {
+      "post": {
+        "operationId": "webhookMessageDelivered",
+        "summary": "message.delivered",
+        "description": "Sent when WhatsApp reports the message delivered to the recipient's device.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageDeliveredEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "messageRead": {
+      "post": {
+        "operationId": "webhookMessageRead",
+        "summary": "message.read",
+        "description": "Sent when the recipient reads the message (subject to their read-receipt settings).",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageReadEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "messageFailed": {
+      "post": {
+        "operationId": "webhookMessageFailed",
+        "summary": "message.failed",
+        "description": "Sent when a message fails to send or expires before dispatch.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageFailedEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "inboundReceived": {
+      "post": {
+        "operationId": "webhookInboundReceived",
+        "summary": "inbound.received",
+        "description": "Sent when the session receives an inbound message from a contact.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InboundReceivedEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "inboundReaction": {
+      "post": {
+        "operationId": "webhookInboundReaction",
+        "summary": "inbound.reaction",
+        "description": "Sent when a contact reacts to a message in the chat. An empty `emoji` means the reaction was cleared.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InboundReactionEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "contactOptedOut": {
+      "post": {
+        "operationId": "webhookContactOptedOut",
+        "summary": "contact.opted_out",
+        "description": "Sent when a contact opts out via keyword (e.g. STOP) or is added to the opt-out registry by an admin. The session rejects future sends to this number with 422 OPTED_OUT.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContactOptedOutEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    },
+    "webhookTest": {
+      "post": {
+        "operationId": "webhookTest",
+        "summary": "webhook.test",
+        "description": "Synthetic heartbeat fired on demand to verify a webhook endpoint. Treat as a no-op.",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookSignatureHeader" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WebhookTestEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Acknowledge receipt with any 2xx status." }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API key supplied as a bearer token, e.g. `Authorization: Bearer hmd_sk_<division>_<env>_<secret>`."
+      }
+    },
+    "parameters": {
+      "MessageId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Gateway message UUID returned by POST /v1/messages.",
+        "schema": { "type": "string", "format": "uuid" }
+      },
+      "IdempotencyKeyHeader": {
+        "name": "idempotency-key",
+        "in": "header",
+        "required": false,
+        "description": "Optional idempotency key. The pair (API key, idempotency-key) is unique. A replay returns the original result with `idempotent: true`. May also be supplied in the request body as `idempotencyKey`.",
+        "schema": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128
+        }
+      },
+      "WebhookSignatureHeader": {
+        "name": "X-HMD-Signature",
+        "in": "header",
+        "required": true,
+        "description": "Signature of the raw request body in the form `t=<unix-seconds>,v1=<hex-sha256>`, where `v1 = HMAC-SHA256(secret, \"${t}.${rawBody}\")`. Reject the delivery if the timestamp is outside a 300-second window, then recompute and compare the HMAC in constant time over the raw, unmodified body bytes.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request: invalid JSON, schema violation, missing `purpose`, or an unnormalisable phone number.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing, malformed, revoked, or unrecognised bearer token (UNAUTHORIZED).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Authenticated but forbidden: scope missing, session mismatch, or source IP not allowed (SCOPE_DENIED, IP_NOT_ALLOWED).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Referenced resource not found: message or reply target (RECIPIENT_NOT_FOUND, INVALID_BODY).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Reserved (IDEMPOTENCY_CONFLICT): defined for a future body-mismatch check but not currently emitted by POST /v1/messages, which returns the original result on any idempotency-key replay regardless of body.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "Request body exceeded 64 KiB (PAYLOAD_TOO_LARGE).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "Content-Type was not application/json. Note: UNSUPPORTED_MEDIA_TYPE is defined in the protocol but the content-type guard is not currently active.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "UnprocessableEntity": {
+        "description": "Business-logic constraint violated: opted-out recipient, scheduling window, reaction or presence validity, or incompatible field combinations (OPTED_OUT, SEND_AT_PAST, INVALID_REACTION, INVALID_PRESENCE_STATE, INVALID_BODY).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "A rate-limit tier was exceeded or the per-recipient cap was reached (5 sends per 10 min, global across keys). Code: RATE_LIMITED. VELOCITY_EXCEEDED and NEW_RECIPIENT_BLOCKED are protocol-defined but not currently emitted.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Unhandled server error. Quote the requestId when reporting (INTERNAL).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "The bound session (or, for pooled keys, no pooled session) is offline, mid-pairing, or stopped (WORKER_UNAVAILABLE). MAINTENANCE is protocol-defined but not currently emitted.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "E164": {
+        "type": "string",
+        "pattern": "^\\+[1-9]\\d{6,14}$",
+        "description": "Phone number in E.164 format.",
+        "examples": ["+447700900123"]
+      },
+      "MessagePurpose": {
+        "type": "string",
+        "description": "Caller-declared intent of the message; drives compliance routing, retention, and audit. Required on send, no default.",
+        "enum": [
+          "otp",
+          "magic_link",
+          "transactional",
+          "notification",
+          "support",
+          "marketing",
+          "campaign",
+          "newsletter",
+          "announcement",
+          "other"
+        ]
+      },
+      "MessageChannel": {
+        "type": "string",
+        "description": "Message classification; drives the scope check and worker throttle category.",
+        "enum": ["notification", "transactional", "internal"]
+      },
+      "MessageStatus": {
+        "type": "string",
+        "description": "Lifecycle status of a message.",
+        "enum": ["queued", "scheduled", "sent", "delivered", "read", "failed", "expired"]
+      },
+      "BodyKind": {
+        "type": "string",
+        "enum": ["text", "image", "document"]
+      },
+      "TextBody": {
+        "type": "object",
+        "description": "A plain text message.",
+        "required": ["kind", "text"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "const": "text" },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "Message text, 1 to 4096 characters."
+          }
+        }
+      },
+      "ImageBody": {
+        "type": "object",
+        "description": "An image message fetched from a publicly reachable URL.",
+        "required": ["kind", "url"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "const": "image" },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS URL of the image. Subject to an SSRF check at send time."
+          },
+          "caption": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Optional caption, up to 1024 characters."
+          }
+        }
+      },
+      "DocumentBody": {
+        "type": "object",
+        "description": "A document message fetched from a publicly reachable URL.",
+        "required": ["kind", "url"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "const": "document" },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS URL of the document. Subject to an SSRF check at send time."
+          },
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Optional display filename, 1 to 255 characters."
+          },
+          "caption": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Optional caption, up to 1024 characters."
+          }
+        }
+      },
+      "SendBody": {
+        "description": "The message content, discriminated on `kind`.",
+        "oneOf": [
+          { "$ref": "#/components/schemas/TextBody" },
+          { "$ref": "#/components/schemas/ImageBody" },
+          { "$ref": "#/components/schemas/DocumentBody" }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "text": "#/components/schemas/TextBody",
+            "image": "#/components/schemas/ImageBody",
+            "document": "#/components/schemas/DocumentBody"
+          }
+        }
+      },
+      "ReplyTo": {
+        "type": "object",
+        "description": "Quote a prior outbound message. Cannot be combined with `sendAt`.",
+        "required": ["messageId"],
+        "additionalProperties": false,
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Gateway UUID of a prior outbound message in the same session."
+          }
+        }
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": ["to", "purpose", "body"],
+        "additionalProperties": false,
+        "properties": {
+          "to": {
+            "type": "string",
+            "minLength": 6,
+            "maxLength": 40,
+            "description": "Recipient. Either a phone number, or a WhatsApp group JID for a standalone group send. Phone: E.164 is canonical (+447700900123); the gateway also normalises numbers with spaces, dashes or parentheses, and unnormalisable input returns 400 INVALID_PHONE. Group: pass the group JID (120363XXXXXXXXXXXX@g.us); the gateway validates its shape and dispatches through the same path as a DM. Group caveats: replyTo is rejected with 422 (group quoting is not yet supported), and the opt-out registry does not apply (a group send is never blocked by OPTED_OUT)."
+          },
+          "channel": {
+            "allOf": [{ "$ref": "#/components/schemas/MessageChannel" }],
+            "default": "transactional",
+            "description": "Message classification; selects the required send scope. Defaults to `transactional`."
+          },
+          "purpose": { "$ref": "#/components/schemas/MessagePurpose" },
+          "body": { "$ref": "#/components/schemas/SendBody" },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128,
+            "description": "Optional idempotency key, 8 to 128 characters. A replay returns the original result with `idempotent: true`."
+          },
+          "ttlSeconds": {
+            "type": "integer",
+            "minimum": 30,
+            "maximum": 86400,
+            "default": 1800,
+            "description": "Seconds to wait before dropping the message if still queued. 30 to 86400 (24 hours); defaults to 1800 (30 minutes). After expiry the message transitions to `expired`."
+          },
+          "replyTo": { "$ref": "#/components/schemas/ReplyTo" },
+          "sendAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 UTC datetime to schedule the send. Must be at least 30 seconds and at most 30 days in the future. Cannot be combined with `confirm` or `replyTo`."
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt into synchronous confirm: wait for a terminal status before responding (200 rather than 202). Cannot be combined with `sendAt`."
+          },
+          "confirmTimeoutMs": {
+            "type": "integer",
+            "minimum": 300,
+            "maximum": 30000,
+            "default": 5000,
+            "description": "Confirm-mode wait window in milliseconds, 300 to 30000. Used only when `confirm` is true. On timeout the response status is `queued`."
+          }
+        }
+      },
+      "SendMessageResponse": {
+        "type": "object",
+        "required": ["messageId", "status"],
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Gateway-assigned message UUID."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "scheduled", "sent", "delivered", "read", "failed", "expired"],
+            "description": "Resulting status. Async sends return `queued` or `scheduled`; confirm sends return `sent`, `failed`, or `queued` on timeout."
+          },
+          "scheduledFor": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Present on scheduled sends: the dispatch time."
+          },
+          "idempotent": {
+            "type": "boolean",
+            "description": "True when an idempotency key replayed a prior message."
+          },
+          "errorCode": {
+            "type": "string",
+            "description": "Machine-readable failure code; present only when status is `failed`."
+          },
+          "requestId": {
+            "type": "string",
+            "description": "Mirrors the X-Request-Id response header. Present on confirm and idempotent-replay bodies."
+          }
+        }
+      },
+      "MessageListItem": {
+        "type": "object",
+        "required": ["messageId", "to", "channel", "purpose", "status", "createdAt", "body"],
+        "properties": {
+          "messageId": { "type": "string", "format": "uuid" },
+          "to": { "type": "string", "description": "Recipient phone number in E.164." },
+          "channel": { "$ref": "#/components/schemas/MessageChannel" },
+          "purpose": { "$ref": "#/components/schemas/MessagePurpose" },
+          "status": { "$ref": "#/components/schemas/MessageStatus" },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 creation time."
+          },
+          "body": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "$ref": "#/components/schemas/BodyKind" }
+            },
+            "description": "Body summary; only `kind` is exposed in the list view."
+          }
+        }
+      },
+      "MessageListResponse": {
+        "type": "object",
+        "required": ["messages"],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "description": "A page of message summaries, newest first. There is no cursor field; to page backwards pass the messageId of the last item as the `before` query parameter. A page with fewer than `limit` items is the last page.",
+            "items": { "$ref": "#/components/schemas/MessageListItem" }
+          }
+        }
+      },
+      "MessageStatusHistoryEntry": {
+        "type": "object",
+        "required": ["status", "at"],
+        "properties": {
+          "status": { "$ref": "#/components/schemas/MessageStatus" },
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the status was recorded."
+          },
+          "code": {
+            "type": "string",
+            "description": "Optional machine-readable status code."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Optional human-readable detail."
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "required": [
+          "messageId",
+          "to",
+          "channel",
+          "purpose",
+          "status",
+          "statusHistory",
+          "createdAt",
+          "ttlExpiresAt",
+          "body"
+        ],
+        "properties": {
+          "messageId": { "type": "string", "format": "uuid" },
+          "to": { "type": "string", "description": "Recipient phone number in E.164." },
+          "channel": { "$ref": "#/components/schemas/MessageChannel" },
+          "purpose": { "$ref": "#/components/schemas/MessagePurpose" },
+          "status": { "$ref": "#/components/schemas/MessageStatus" },
+          "statusHistory": {
+            "type": "array",
+            "description": "Chronological status transitions.",
+            "items": { "$ref": "#/components/schemas/MessageStatusHistoryEntry" }
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 creation time."
+          },
+          "ttlExpiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 time after which an unsent message is dropped."
+          },
+          "errorCode": {
+            "type": "string",
+            "description": "Failure code; present only when status is `failed`."
+          },
+          "body": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "$ref": "#/components/schemas/BodyKind" }
+            },
+            "description": "Body summary; only `kind` is exposed in the detail view."
+          }
+        }
+      },
+      "ReactionRequest": {
+        "type": "object",
+        "required": ["emoji"],
+        "additionalProperties": false,
+        "properties": {
+          "emoji": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8,
+            "description": "A single Unicode emoji (Extended_Pictographic), 1 to 8 characters. Use DELETE to clear a reaction; an empty emoji on POST returns 422 INVALID_REACTION.",
+            "examples": ["👍"]
+          }
+        }
+      },
+      "ReactionResponse": {
+        "type": "object",
+        "required": ["messageId", "emoji", "status"],
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the reaction operation (not the target message)."
+          },
+          "emoji": {
+            "type": "string",
+            "description": "The emoji set, or an empty string when cleared."
+          },
+          "status": {
+            "type": "string",
+            "const": "queued"
+          }
+        }
+      },
+      "PresenceState": {
+        "type": "string",
+        "description": "Presence indicator. `available`/`unavailable` set the online state; `composing`/`recording`/`paused` reflect typing or audio activity.",
+        "enum": ["available", "unavailable", "composing", "recording", "paused"]
+      },
+      "PresenceRequest": {
+        "type": "object",
+        "required": ["state"],
+        "additionalProperties": false,
+        "properties": {
+          "state": { "$ref": "#/components/schemas/PresenceState" },
+          "to": {
+            "type": "string",
+            "minLength": 6,
+            "maxLength": 20,
+            "description": "Optional recipient. When set, the indicator is scoped to that chat only; unnormalisable input returns 400 INVALID_PHONE."
+          }
+        }
+      },
+      "PresenceResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "const": "queued" }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["ok", "service", "time"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "service": { "type": "string", "const": "hmd-wa-gateway" },
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 server time."
+          }
+        }
+      },
+      "WorkerStatusResponse": {
+        "type": "object",
+        "required": [
+          "workerId",
+          "status",
+          "lastHeartbeatAt",
+          "connectedAt",
+          "phoneE164",
+          "version",
+          "queueDepth"
+        ],
+        "properties": {
+          "workerId": { "type": "string" },
+          "sessionId": {
+            "type": "string",
+            "description": "Present when the calling API key is bound to a session."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["initialising", "pairing", "connected", "degraded", "offline", "stopped"],
+            "description": "Effective session status. Reported as `offline` when the heartbeat is older than 60 seconds."
+          },
+          "lastHeartbeatAt": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "ISO 8601 time of the last worker heartbeat, or null."
+          },
+          "connectedAt": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "ISO 8601 time the session connected, or null."
+          },
+          "phoneE164": {
+            "type": ["string", "null"],
+            "description": "Paired phone number in E.164, or null."
+          },
+          "version": {
+            "type": ["string", "null"],
+            "description": "Worker version, or null."
+          },
+          "queueDepth": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Pending outbound queue depth, or null when unknown."
+          }
+        }
+      },
+      "GroupSummary": {
+        "type": "object",
+        "required": ["jid"],
+        "properties": {
+          "jid": {
+            "type": "string",
+            "description": "WhatsApp group JID.",
+            "examples": ["120363012345678901@g.us"]
+          },
+          "subject": {
+            "type": "string",
+            "description": "Group subject/name, when the gateway has captured one. Not always available."
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 of the most recent message the gateway observed in this group."
+          },
+          "subjectOwner": {
+            "type": "string",
+            "description": "JID of whoever last changed the subject, when captured."
+          },
+          "subjectTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 of the last subject change, when captured."
+          },
+          "creation": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 of group creation, when captured."
+          },
+          "owner": {
+            "type": "string",
+            "description": "Group owner JID, when captured."
+          },
+          "desc": {
+            "type": "string",
+            "description": "Group description, when captured."
+          },
+          "descId": {
+            "type": "string",
+            "description": "Opaque id of the current description, when captured."
+          },
+          "announce": {
+            "type": "boolean",
+            "description": "Only admins may post when true."
+          },
+          "restrict": {
+            "type": "boolean",
+            "description": "Only admins may change group settings when true."
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Participant count as reported by Baileys, independent of participants.length."
+          },
+          "ephemeralDuration": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disappearing-messages duration in seconds; absent or 0 means off."
+          },
+          "inviteCode": {
+            "type": "string",
+            "description": "Current group invite code, when captured."
+          },
+          "participants": {
+            "type": "array",
+            "description": "Every group member's JID and admin role, when captured. Exposed to any API key holding read:groups, see the GET /v1/groups description.",
+            "items": { "$ref": "#/components/schemas/GroupParticipant" }
+          },
+          "metadataFetchedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 of when the gateway last captured this group's metadata."
+          }
+        }
+      },
+      "GroupParticipant": {
+        "type": "object",
+        "required": ["jid"],
+        "properties": {
+          "jid": {
+            "type": "string",
+            "description": "Participant's JID (their phone number, in effect)."
+          },
+          "admin": {
+            "type": ["string", "null"],
+            "enum": ["admin", "superadmin", null],
+            "description": "Admin role, or null when the participant is not an admin."
+          }
+        }
+      },
+      "GroupListResponse": {
+        "type": "object",
+        "required": ["groups"],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "description": "The session's known groups. May be empty if the session has not yet been observed in any group.",
+            "items": { "$ref": "#/components/schemas/GroupSummary" }
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": ["error", "code", "requestId"],
+        "description": "Flat error body returned on every non-2xx response. Match on `code`, never on the human-readable `error` string.",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable error message; may change without notice."
+          },
+          "code": {
+            "type": "string",
+            "description": "Machine-readable, stable error code. All values are valid contract codes; those marked reserved in the API reference (MAINTENANCE, NEW_RECIPIENT_BLOCKED, UNSUPPORTED_MEDIA_TYPE, VELOCITY_EXCEEDED, WEBAUTHN_REQUIRED) are defined but not currently emitted by any route. INVALID_CONTENT is emitted by `POST /v1/messages` when an `image` or `document` `url` fails host validation.",
+            "enum": [
+              "INVALID_PHONE",
+              "INVALID_CONTENT",
+              "INVALID_BODY",
+              "UNAUTHORIZED",
+              "SCOPE_DENIED",
+              "IP_NOT_ALLOWED",
+              "WEBAUTHN_REQUIRED",
+              "RECIPIENT_NOT_FOUND",
+              "INVALID_PRESENCE_STATE",
+              "INVALID_REACTION",
+              "OPTED_OUT",
+              "SEND_AT_PAST",
+              "IDEMPOTENCY_CONFLICT",
+              "PAYLOAD_TOO_LARGE",
+              "UNSUPPORTED_MEDIA_TYPE",
+              "RATE_LIMITED",
+              "VELOCITY_EXCEEDED",
+              "NEW_RECIPIENT_BLOCKED",
+              "WORKER_UNAVAILABLE",
+              "MAINTENANCE",
+              "INTERNAL"
+            ]
+          },
+          "requestId": {
+            "type": "string",
+            "description": "Unique request identifier; mirrors the X-Request-Id header."
+          }
+        }
+      },
+      "WebhookEventBase": {
+        "type": "object",
+        "required": ["type", "at", "eventId", "sessionId"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Event discriminator."
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 UTC time the event was emitted."
+          },
+          "eventId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID v4, stable across retries for idempotent processing."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Session that produced the event."
+          }
+        }
+      },
+      "MessageQueuedEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "messageId", "to", "category"],
+            "properties": {
+              "type": { "type": "string", "const": "message.queued" },
+              "messageId": { "type": "string", "format": "uuid" },
+              "to": { "$ref": "#/components/schemas/E164" },
+              "category": { "$ref": "#/components/schemas/MessageChannel" }
+            }
+          }
+        ]
+      },
+      "MessageSentEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "messageId", "waMessageId"],
+            "properties": {
+              "type": { "type": "string", "const": "message.sent" },
+              "messageId": { "type": "string", "format": "uuid" },
+              "waMessageId": { "type": "string", "description": "Raw WhatsApp message id." }
+            }
+          }
+        ]
+      },
+      "MessageDeliveredEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "messageId", "waMessageId"],
+            "properties": {
+              "type": { "type": "string", "const": "message.delivered" },
+              "messageId": { "type": "string", "format": "uuid" },
+              "waMessageId": { "type": "string", "description": "Raw WhatsApp message id." }
+            }
+          }
+        ]
+      },
+      "MessageReadEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "messageId", "waMessageId"],
+            "properties": {
+              "type": { "type": "string", "const": "message.read" },
+              "messageId": { "type": "string", "format": "uuid" },
+              "waMessageId": { "type": "string", "description": "Raw WhatsApp message id." }
+            }
+          }
+        ]
+      },
+      "MessageFailedEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "messageId", "status", "error"],
+            "properties": {
+              "type": { "type": "string", "const": "message.failed" },
+              "messageId": { "type": "string", "format": "uuid" },
+              "status": { "$ref": "#/components/schemas/MessageStatus" },
+              "error": {
+                "type": "object",
+                "required": ["code", "message", "retryable"],
+                "properties": {
+                  "code": { "type": "string", "description": "WhatsApp or gateway error code." },
+                  "message": { "type": "string", "description": "Human-readable detail." },
+                  "retryable": { "type": "boolean", "description": "Whether a retry is advisable." }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "InboundContent": {
+        "description": "Inbound message content, discriminated on `type`.",
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type", "text"],
+            "properties": {
+              "type": { "type": "string", "const": "text" },
+              "text": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "mediaUrl"],
+            "properties": {
+              "type": { "type": "string", "const": "image" },
+              "mediaUrl": { "type": "string", "format": "uri" },
+              "mediaMimeType": { "type": "string" },
+              "caption": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "mediaUrl", "mediaFileName"],
+            "properties": {
+              "type": { "type": "string", "const": "document" },
+              "mediaUrl": { "type": "string", "format": "uri" },
+              "mediaFileName": { "type": "string" },
+              "mediaMimeType": { "type": "string" },
+              "caption": { "type": "string" }
+            }
+          }
+        ],
+        "discriminator": { "propertyName": "type" }
+      },
+      "InboundReceivedEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "waMessageId", "from", "content"],
+            "properties": {
+              "type": { "type": "string", "const": "inbound.received" },
+              "waMessageId": { "type": "string", "description": "Raw WhatsApp message id." },
+              "from": { "$ref": "#/components/schemas/E164" },
+              "content": { "$ref": "#/components/schemas/InboundContent" }
+            }
+          }
+        ]
+      },
+      "InboundReactionEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "waMessageId", "targetFromMe", "from", "emoji"],
+            "properties": {
+              "type": { "type": "string", "const": "inbound.reaction" },
+              "messageId": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Gateway UUID, set when the reacted-to message was authored by us."
+              },
+              "waMessageId": {
+                "type": "string",
+                "description": "Raw WhatsApp id of the reacted-to message."
+              },
+              "targetFromMe": {
+                "type": "boolean",
+                "description": "Whether we authored the original message."
+              },
+              "from": { "$ref": "#/components/schemas/E164" },
+              "emoji": {
+                "type": "string",
+                "description": "The reaction emoji; empty string when cleared."
+              }
+            }
+          }
+        ]
+      },
+      "ContactOptedOutEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "phone", "source"],
+            "properties": {
+              "type": { "type": "string", "const": "contact.opted_out" },
+              "phone": { "$ref": "#/components/schemas/E164" },
+              "source": {
+                "type": "string",
+                "enum": ["keyword", "admin"],
+                "description": "How the opt-out was registered."
+              },
+              "keyword": {
+                "type": "string",
+                "description": "The exact keyword that triggered the opt-out; present only when source is `keyword`."
+              }
+            }
+          }
+        ]
+      },
+      "WebhookTestEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/WebhookEventBase" },
+          {
+            "type": "object",
+            "required": ["type", "message"],
+            "properties": {
+              "type": { "type": "string", "const": "webhook.test" },
+              "message": {
+                "type": "string",
+                "const": "This is a test webhook from HMD WA Gateway."
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

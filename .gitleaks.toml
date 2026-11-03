@@ -1,0 +1,22 @@
+# Gitleaks configuration.
+#
+# The public API documentation under apps/gateway/src/app/docs carries
+# illustrative example payloads: idempotency keys, truncated sample bearer
+# tokens, and example webhook signatures. These are deliberately fake and are
+# served to the public, so they are not secrets. gitleaks' generic-api-key
+# entropy heuristic repeatedly flags the example values (e.g. an
+# "idempotencyKey": "order-4711-..." string), which produced recurring false
+# failures. Scope the scanner away from the documentation source and the
+# generated OpenAPI spec and llms-full.txt docs bundle only; every other path
+# keeps the full default ruleset, so real secrets in code, config, env files,
+# and the worker still get caught.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public API documentation examples are not secrets"
+paths = [
+  '''apps/gateway/src/app/docs/.*''',
+  '''apps/gateway/public/openapi\.json''',
+  '''apps/gateway/public/llms-full\.txt''',
+]

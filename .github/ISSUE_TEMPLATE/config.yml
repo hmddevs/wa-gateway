@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hmddevs/wa-gateway/security/advisories/new
+    about: Please DO NOT open public issues for security problems. Email security@hmddevs.org or open a private advisory.
+  - name: Question / Discussion
+    url: https://github.com/hmddevs/wa-gateway/discussions
+    about: Ask questions in Discussions rather than Issues.

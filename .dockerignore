@@ -1,0 +1,56 @@
+# ── Source artefacts ───────────────────────────────────────────────────────────
+# These are rebuilt inside the container; shipping them wastes layer space and
+# can cause stale-artefact bugs if the host build differs from the Linux build.
+node_modules
+**/node_modules
+**/.next
+**/dist
+**/.turbo
+# Incremental tsc cache. If shipped into the build context it makes the
+# composite @hmddevs/protocol build believe it is up to date and emit no dist,
+# which then breaks `next build`'s resolution of the workspace package.
+**/*.tsbuildinfo
+
+# ── Git internals ─────────────────────────────────────────────────────────────
+.git
+.gitattributes
+.gitignore
+
+# ── Secrets and environment ────────────────────────────────────────────────────
+# NEVER ship env files or key material into the image.
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.env
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+
+# ── Docs (not needed at runtime) ──────────────────────────────────────────────
+docs
+*.md
+!apps/gateway/public/**/*.md
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+coverage
+**/__tests__
+**/*.test.ts
+**/*.spec.ts
+**/*.test.tsx
+**/*.spec.tsx
+
+# ── macOS and editor noise ─────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+.idea
+.vscode
+*.swp
+*.swo
+
+# ── Scripts (runtime not needed in gateway image) ─────────────────────────────
+scripts
+
+# ── Docs site (published separately, not part of the gateway image) ──────────
+docs-site

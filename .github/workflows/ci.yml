@@ -1,0 +1,99 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint / Typecheck / Test / Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # pnpm/action-setup v6.0.0–v6.0.7 silently ignored the `version` input
+      # and installed latest pnpm (see pnpm/action-setup#225, #227). Fixed in
+      # v6.0.8. We need the pin to hold: pnpm >=10.18 bundles a transitive
+      # node:sqlite import (Node 22.5+ builtin) which fails on Node 20.
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+        with:
+          version: 10.10.0
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install (frozen, no scripts)
+        run: pnpm install --frozen-lockfile
+        env:
+          CI: true
+
+      - name: Build protocol
+        run: pnpm --filter @hmddevs/protocol build
+
+      - name: Lint
+        run: pnpm -r lint
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Build
+        run: pnpm build
+        env:
+          SKIP_ENV_VALIDATION: '1'
+
+      - name: Test
+        run: pnpm -r test
+        env:
+          # Unit tests mock Mongo/Redis rather than connecting for real, so
+          # they don't need the ~18 production secrets apps/gateway/src/lib/env.ts
+          # validates at runtime. No repo secret backs those vars in Actions,
+          # so without this every gateway test importing @/lib/mongo or
+          # @/lib/redis crashes at import time on env validation, not on the
+          # test's own logic.
+          SKIP_ENV_VALIDATION: '1'
+
+      # The LLM corpus is hand-written but served to agents as the complete API
+      # reference, so nothing stops it drifting when an endpoint or scope ships.
+      # Assert coverage, not prose.
+      - name: LLM corpus drift
+        run: pnpm check:llms
+
+      - name: Audit (high+critical)
+        run: |
+          # `pnpm audit` exits non-zero on ANY advisory (incl. moderate/low).
+          # GitHub's default shell runs with `pipefail`, which would let that
+          # exit fail the step and defeat the node filter below. Disable it so
+          # the node filter is the sole arbiter: only high/critical block.
+          set +o pipefail
+          pnpm audit --prod --json | node -e "
+            const c=[]; process.stdin.on('data',d=>c.push(d)); process.stdin.on('end',()=>{
+              const d=JSON.parse(Buffer.concat(c));
+              const ignore=new Set([
+                'GHSA-v6c2-xwv6-8xf7'
+              ]);
+              const bad=Object.values(d.advisories||{}).filter(
+                a=>!ignore.has(a.github_advisory_id)&&['high','critical'].includes(a.severity)
+              );
+              if(bad.length){bad.forEach(a=>process.stderr.write(a.severity+' '+a.github_advisory_id+' '+a.module_name+'\n'));process.exit(1);}
+            });"

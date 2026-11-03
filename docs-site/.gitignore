@@ -1,0 +1,7 @@
+# Developed by HMD Developments
+# For HMD WA Gateway
+# www.hmddevs.org
+
+node_modules
+docs/.vitepress/cache
+docs/.vitepress/dist

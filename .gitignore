@@ -1,0 +1,15 @@
+node_modules
+.pnpm-store
+dist
+.next
+.turbo
+*.log
+.DS_Store
+.env
+.env.local
+.env.*.local
+.vercel
+coverage
+*.tsbuildinfo
+
+.wrangler/

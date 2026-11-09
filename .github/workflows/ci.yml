@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
         with:
           egress-policy: audit
 
@@ -31,7 +31,7 @@ jobs:
       # and installed latest pnpm (see pnpm/action-setup#225, #227). Fixed in
       # v6.0.8. We need the pin to hold: pnpm >=10.18 bundles a transitive
       # node:sqlite import (Node 22.5+ builtin) which fails on Node 20.
-      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 10.10.0
 
